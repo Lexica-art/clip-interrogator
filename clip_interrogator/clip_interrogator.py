@@ -67,7 +67,6 @@ class Interrogator():
         self.dtype = torch.float16 if self.device == 'cuda' else torch.float32
         self.caption_offloaded = True
         self.clip_offloaded = True
-        self.load_caption_model()
         self.load_clip_model()
 
     def load_caption_model(self):
@@ -114,6 +113,7 @@ class Interrogator():
         else:
             self.clip_model = config.clip_model
             self.clip_preprocess = config.clip_preprocess
+
         self.tokenize = open_clip.get_tokenizer(clip_model_name)
 
         sites = ['Artstation', 'behance', 'cg society', 'cgsociety', 'deviantart', 'dribbble', 
@@ -194,19 +194,22 @@ class Interrogator():
         tokens = self.caption_model.generate(**inputs, max_new_tokens=self.config.caption_max_length)
         return self.caption_processor.batch_decode(tokens, skip_special_tokens=True)[0].strip()
 
-    def image_to_features(self, image: Image) -> torch.Tensor:
+    def image_to_features(self, image: Image = None, image_tensor: torch.Tensor = None) -> torch.Tensor:
         self._prepare_clip()
-        images = self.clip_preprocess(image).unsqueeze(0).to(self.device)
+        if image_tensor is None:
+            image_tensor = self.clip_preprocess(image).unsqueeze(0)
+        image_tensor = image_tensor.to(self.device)
+
         with torch.no_grad(), torch.cuda.amp.autocast():
-            image_features = self.clip_model.encode_image(images)
+            image_features = self.clip_model.encode_image(image_tensor)
             image_features /= image_features.norm(dim=-1, keepdim=True)
         return image_features
 
-    def interrogate_classic(self, image: Image, max_flavors: int=3, caption: Optional[str]=None) -> str:
+    def interrogate_classic(self, image: Image = None,  image_tensor: Optional[torch.Tensor]=None, max_flavors: int=3, caption: Optional[str]=None) -> str:
         """Classic mode creates a prompt in a standard format first describing the image, 
         then listing the artist, trending, movement, and flavor text modifiers."""
         caption = caption or self.generate_caption(image)
-        image_features = self.image_to_features(image)
+        image_features = self.image_to_features(image, image_tensor=image_tensor)
 
         medium = self.mediums.rank(image_features, 1)[0]
         artist = self.artists.rank(image_features, 1)[0]
@@ -220,17 +223,60 @@ class Interrogator():
             prompt = f"{caption}, {medium} {artist}, {trending}, {movement}, {flaves}"
 
         return _truncate_to_fit(prompt, self.tokenize)
+    
+    def interrogate_classic_batch(self, image_tensor: Optional[torch.Tensor]=None, captions: Optional[List[str]]=None, max_flavors: int=3, ) -> str:
+        """Classic mode creates a prompt in a standard format first describing the image, 
+        then listing the artist, trending, movement, and flavor text modifiers."""
 
-    def interrogate_fast(self, image: Image, max_flavors: int=32, caption: Optional[str]=None) -> str:
+        image_features = self.image_to_features(image_tensor=image_tensor)
+
+        medium = self.mediums.rank_batch(image_features, 1)
+        artist = self.artists.rank_batch(image_features, 1)
+        trending = self.trendings.rank_batch(image_features, 1)
+        movement = self.movements.rank_batch(image_features, 1)
+
+        flaves = self.flavors.rank_batch(image_features, max_flavors, printout=False)
+        batch_size = image_features.shape[0]
+        prompts = []
+        for i in range(batch_size):     
+            caption = captions[i].strip()
+            caption = caption[:-1] if caption.endswith('.') else caption 
+            if caption.startswith(medium[i][0]):
+                prompt = f"{caption} {artist[i][0]}, {trending[i][0]}, {movement[i][0]}, {', '.join(list(set(flaves[i])))}"
+            else:
+                prompt = f"{caption} - {medium[i][0]} {artist[i][0]}, {trending[i][0]}, {movement[i][0]}, {', '.join(list(set(flaves[i])))}"
+            prompts.append(_truncate_to_fit(prompt, self.tokenize))
+
+        return prompts
+
+    def interrogate_fast(self, image = None, max_flavors: int=32, image_tensor: Optional[torch.Tensor]=None, caption: Optional[str]=None) -> str:
         """Fast mode simply adds the top ranked terms after a caption. It generally results in 
         better similarity between generated prompt and image than classic mode, but the prompts
         are less readable."""
         caption = caption or self.generate_caption(image)
-        image_features = self.image_to_features(image)
+        image_features = self.image_to_features(image=image, image_tensor=image_tensor)
         merged = _merge_tables([self.artists, self.flavors, self.mediums, self.movements, self.trendings], self)
         tops = merged.rank(image_features, max_flavors)
         return _truncate_to_fit(caption + ", " + ", ".join(tops), self.tokenize)
+    
+    def interrogate_fast_batch(self, image_tensor: Optional[torch.Tensor]=None, captions: Optional[List[str]]=None, max_flavors: int=32) -> str:
+        """Fast mode simply adds the top ranked terms after a caption. It generally results in 
+        better similarity between generated prompt and image than classic mode, but the prompts
+        are less readable."""
+        image_features = self.image_to_features(image_tensor=image_tensor)
 
+        merged = _merge_tables([self.artists, self.flavors, self.mediums, self.movements, self.trendings], self)
+        tops = merged.rank_batch(image_features, max_flavors)
+        
+        batch_size = image_features.shape[0]
+        prompts = []
+        for i in range(batch_size):
+            prompt = captions[i] + ", " + ", ".join(list(set(tops[i])))         
+            prompts.append(_truncate_to_fit(prompt, self.tokenize))
+            
+        return prompts
+
+    
     def interrogate_negative(self, image: Image, max_flavors: int = 32) -> str:
         """Negative mode chains together the most dissimilar terms to the image. It can be used
         to help build a negative prompt to pair with the regular positive prompt and often 
@@ -307,6 +353,7 @@ class LabelTable():
         self.config = config
         self.device = config.device
         self.embeds = []
+        self.embeds_pt = None
         self.labels = labels
         self.tokenize = ci.tokenize
 
@@ -337,6 +384,8 @@ class LabelTable():
 
         if self.device == 'cpu' or self.device == torch.device('cpu'):
             self.embeds = [e.astype(np.float32) for e in self.embeds]
+            
+        self.embeds_pt = torch.from_numpy(np.stack(self.embeds)).to(self.device)
 
     def _load_cached(self, desc:str, hash:str, sanitized_name:str) -> bool:
         if self.config.cache_path is None or desc is None:
@@ -398,6 +447,44 @@ class LabelTable():
 
         tops = self._rank(image_features, top_embeds, top_count=top_count)
         return [top_labels[i] for i in tops]
+
+    
+    def _rank_batch(self, image_features: torch.Tensor, text_embeds: torch.Tensor, top_count: int=1, reverse: bool=False, printout: bool=False) -> str:
+        top_count = min(top_count, len(text_embeds))
+        text_embeds = torch.from_numpy(np.stack(text_embeds)).to(self.device)
+
+        with torch.cuda.amp.autocast():
+            similarity = image_features @ text_embeds.T
+            if reverse:
+                similarity = -similarity
+
+        _, top_labels = similarity.float().topk(top_count, dim=-1)
+        top_labels = top_labels.cpu()
+
+        filtered = top_labels[:, :top_count].numpy()
+
+        return filtered
+    
+    def rank_batch(self, image_features: torch.Tensor, top_count: int=1, reverse: bool=False, printout = False) -> List[str]:
+        if len(self.labels) <= self.chunk_size:
+            tops_batch = self._rank_batch(image_features, self.embeds, top_count=top_count, reverse=reverse)
+            return [[self.labels[i] for i in tops] for tops in tops_batch]
+
+        num_chunks = int(math.ceil(len(self.labels)/self.chunk_size))
+        keep_per_chunk = int(self.chunk_size / num_chunks)
+
+        top_labels, top_embeds = [], []
+        for chunk_idx in tqdm(range(num_chunks), disable=self.config.quiet):
+            start = chunk_idx*self.chunk_size
+            stop = min(start+self.chunk_size, len(self.embeds))
+            
+            tops = self._rank_batch(image_features, self.embeds[start:stop], top_count=keep_per_chunk, reverse=reverse, printout = printout)
+            top_labels.extend([self.labels[start+i] for i in tops.ravel()])
+            top_embeds.extend([self.embeds[start+i] for i in tops.ravel()])
+
+        tops_batch = self._rank_batch(image_features, top_embeds, top_count=top_count, printout=printout)
+
+        return [[top_labels[i] for i in tops] for tops in tops_batch]
 
 
 def _download_file(url: str, filepath: str, chunk_size: int = 4*1024*1024, quiet: bool = False):
